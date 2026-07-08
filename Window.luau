@@ -1,0 +1,377 @@
+local GuiService = game:GetService("GuiService")
+local UserInputService = game:GetService("UserInputService")
+local TextChatService = game:GetService("TextChatService")
+local Players = game:GetService("Players")
+local Player = Players.LocalPlayer
+
+local WINDOW_MAX_HEIGHT = 300
+local MOUSE_TOUCH_ENUM = { Enum.UserInputType.MouseButton1, Enum.UserInputType.MouseButton2, Enum.UserInputType.Touch }
+
+local Window = {
+	Valid = true,
+	AutoComplete = nil,
+	ProcessEntry = nil,
+	OnTextChanged = nil,
+	Cmdr = nil,
+	HistoryState = nil,
+	_roleVisualCallback = nil,
+	_appliedVisual = false,
+}
+
+local Gui = Player:WaitForChild("PlayerGui"):WaitForChild("Cmdr"):WaitForChild("Frame")
+local Line = Gui:WaitForChild("Line")
+local Entry = Gui:WaitForChild("Entry")
+
+local Role = require(game.ReplicatedStorage.Configuration.CommandsPermissions).Raw
+
+Line.Parent = nil
+
+local function buildPermissionErrorMessage(commandName, commandGroup, playerRole)
+	local groupStr
+	if type(commandGroup) == "table" then
+		groupStr = table.concat(commandGroup, ", ")
+	elseif type(commandGroup) == "string" then
+		groupStr = commandGroup
+	else
+		groupStr = "unknown"
+	end
+
+	return ("Permission denied: command \"%s\" requires one of [%s]. Your current role is \"%s\". Contact an administrator if you believe this is an error."):format(
+		commandName or "unknown",
+		groupStr,
+		playerRole or "No Role"
+	)
+end
+
+function Window:SetRoleVisual(callback)
+	self._roleVisualCallback = callback
+	if not self._appliedVisual then
+		local plrRole = self:GetPlayerRole()
+		if plrRole then
+			self._appliedVisual = true
+			callback(plrRole, Entry.TextLabel)
+		end
+	end
+end
+
+function Window:GetPlayerRole()
+	local userId = Player.UserId
+	for groupName, members in pairs(Role) do
+		if table.find(members, userId) then
+			return groupName
+		end
+	end
+	return nil
+end
+
+function Window:UpdateLabel()
+	local plrRole = self:GetPlayerRole()
+	if plrRole then
+		Entry.TextLabel.Text = Player.Name .. "_" .. plrRole .. ": "
+		if not self._appliedVisual and self._roleVisualCallback then
+			self._appliedVisual = true
+			self._roleVisualCallback(plrRole, Entry.TextLabel)
+		end
+	else
+		Entry.TextLabel.Text = Player.Name
+	end
+end
+
+function Window:GetLabel()
+	return Entry.TextLabel.Text
+end
+
+function Window:UpdateWindowHeight()
+	local windowHeight = Gui.UIListLayout.AbsoluteContentSize.Y
+		+ Gui.UIPadding.PaddingTop.Offset
+		+ Gui.UIPadding.PaddingBottom.Offset
+	Gui.Size = UDim2.new(Gui.Size.X.Scale, Gui.Size.X.Offset, 0, math.clamp(windowHeight, 0, WINDOW_MAX_HEIGHT))
+	Gui.CanvasPosition = Vector2.new(0, windowHeight)
+end
+
+function Window:AddLine(text, options)
+	options = options or {}
+	text = tostring(text)
+
+	if typeof(options) == "Color3" then
+		options = { Color = options }
+	end
+
+	if #text == 0 then
+		Window:UpdateWindowHeight()
+		return
+	end
+
+	local str = self.Cmdr.Util.EmulateTabstops(text or "nil", 8)
+
+	local line = Line:Clone()
+	line.Text = str
+	line.TextColor3 = options.Color or line.TextColor3
+	line.RichText = options.RichText or false
+	line.Parent = Gui
+end
+
+function Window:AddErrorLine(text, commandName, commandGroup)
+	local detailedText
+	if commandName and commandGroup then
+		local playerRole = self:GetPlayerRole()
+		detailedText = buildPermissionErrorMessage(commandName, commandGroup, playerRole)
+	else
+		detailedText = text
+	end
+
+	self:AddLine(detailedText, Color3.fromRGB(255, 90, 90))
+end
+
+function Window:IsVisible()
+	return Gui.Visible
+end
+
+function Window:SetVisible(visible)
+	Gui.Visible = visible
+
+	if visible then
+		self.PreviousChatWindowConfigurationEnabled = TextChatService.ChatWindowConfiguration.Enabled
+		self.PreviousChatInputBarConfigurationEnabled = TextChatService.ChatInputBarConfiguration.Enabled
+		TextChatService.ChatWindowConfiguration.Enabled = false
+		TextChatService.ChatInputBarConfiguration.Enabled = false
+
+		Entry.TextBox:CaptureFocus()
+		self:SetEntryText("")
+
+		if self.Cmdr.ActivationUnlocksMouse then
+			self.PreviousMouseBehavior = UserInputService.MouseBehavior
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		end
+	else
+		TextChatService.ChatWindowConfiguration.Enabled = if self.PreviousChatWindowConfigurationEnabled ~= nil then
+			self.PreviousChatWindowConfigurationEnabled else true
+		TextChatService.ChatInputBarConfiguration.Enabled = if self.PreviousChatInputBarConfigurationEnabled ~= nil then
+			self.PreviousChatInputBarConfigurationEnabled else true
+
+		Entry.TextBox:ReleaseFocus()
+		self.AutoComplete:Hide()
+
+		if self.PreviousMouseBehavior then
+			UserInputService.MouseBehavior = self.PreviousMouseBehavior
+			self.PreviousMouseBehavior = nil
+		end
+	end
+end
+
+function Window:Hide()
+	return self:SetVisible(false)
+end
+
+function Window:Show()
+	return self:SetVisible(true)
+end
+
+function Window:SetEntryText(text)
+	Entry.TextBox.Text = text
+
+	if self:IsVisible() then
+		Entry.TextBox:CaptureFocus()
+		Entry.TextBox.CursorPosition = #text + 1
+		Window:UpdateWindowHeight()
+	end
+end
+
+function Window:GetEntryText()
+	return Entry.TextBox.Text:gsub("\t", "")
+end
+
+function Window:SetIsValidInput(isValid, errorText)
+	Entry.TextBox.TextColor3 = isValid and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(255, 73, 73)
+	self.Valid = isValid
+	self._errorText = errorText
+end
+
+function Window:HideInvalidState()
+	Entry.TextBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+end
+
+function Window:LoseFocus(submit)
+	local text = Entry.TextBox.Text
+
+	self:ClearHistoryState()
+
+	if Gui.Visible and not GuiService.MenuIsOpen then
+		Entry.TextBox:CaptureFocus()
+	elseif GuiService.MenuIsOpen and Gui.Visible then
+		self:Hide()
+	end
+
+	if submit and self.Valid then
+		task.wait()
+		self:SetEntryText("")
+		self.ProcessEntry(text)
+	elseif submit then
+		self:AddLine(self._errorText, Color3.fromRGB(255, 153, 153))
+	end
+end
+
+function Window:TraverseHistory(delta)
+	local history = self.Cmdr.Dispatcher:GetHistory()
+
+	if self.HistoryState == nil then
+		self.HistoryState = {
+			Position = #history + 1,
+			InitialText = self:GetEntryText(),
+		}
+	end
+
+	self.HistoryState.Position = math.clamp(self.HistoryState.Position + delta, 1, #history + 1)
+
+	self:SetEntryText(
+		self.HistoryState.Position == #history + 1 and self.HistoryState.InitialText
+			or history[self.HistoryState.Position]
+	)
+end
+
+function Window:ClearHistoryState()
+	self.HistoryState = nil
+end
+
+function Window:SelectVertical(delta)
+	if self.AutoComplete:IsVisible() and not self.HistoryState then
+		self.AutoComplete:Select(delta)
+	else
+		self:TraverseHistory(delta)
+	end
+end
+
+local lastPressTime = 0
+local pressCount = 0
+
+function Window:BeginInput(input, gameProcessed)
+	if GuiService.MenuIsOpen then
+		self:Hide()
+	end
+
+	if gameProcessed and self:IsVisible() == false then
+		return
+	end
+
+	if self.Cmdr.ActivationKeys[input.KeyCode] then
+		if self.Cmdr.MashToEnable and not self.Cmdr.Enabled then
+			if tick() - lastPressTime < 1 then
+				if pressCount >= 5 then
+					return self.Cmdr:SetEnabled(true)
+				else
+					pressCount = pressCount + 1
+				end
+			else
+				pressCount = 1
+			end
+			lastPressTime = tick()
+		elseif self.Cmdr.Enabled then
+			self:SetVisible(not self:IsVisible())
+			task.wait()
+			self:SetEntryText("")
+
+			if GuiService.MenuIsOpen then
+				self:Hide()
+			end
+		end
+
+		return
+	end
+
+	if self.Cmdr.Enabled == false or not self:IsVisible() then
+		if self:IsVisible() then
+			self:Hide()
+		end
+
+		return
+	end
+
+	if self.Cmdr.HideOnLostFocus and table.find(MOUSE_TOUCH_ENUM, input.UserInputType) then
+		local ps = input.Position
+		local ap = Gui.AbsolutePosition
+		local as = Gui.AbsoluteSize
+		if ps.X < ap.X or ps.X > ap.X + as.X or ps.Y < ap.Y or ps.Y > ap.Y + as.Y then
+			self:Hide()
+		end
+	elseif input.KeyCode == Enum.KeyCode.Down then
+		self:SelectVertical(1)
+	elseif input.KeyCode == Enum.KeyCode.Up then
+		self:SelectVertical(-1)
+	elseif input.KeyCode == Enum.KeyCode.Return then
+		task.wait()
+		self:SetEntryText(self:GetEntryText():gsub("\n", ""):gsub("\r", ""))
+	elseif input.KeyCode == Enum.KeyCode.Tab then
+		local item = self.AutoComplete:GetSelectedItem()
+		local text = self:GetEntryText()
+		if item and not (text:sub(#text, #text):match("%s") and self.AutoComplete.LastItem) then
+			local replace = item[2]
+			local newText
+			local insertSpace = true
+			local command = self.AutoComplete.Command
+
+			if command then
+				local lastArg = self.AutoComplete.Arg
+
+				newText = command.Alias
+				insertSpace = self.AutoComplete.NumArgs ~= #command.ArgumentDefinitions
+					and self.AutoComplete.IsPartial == false
+
+				local args = command.Arguments
+				for i = 1, #args do
+					local arg = args[i]
+					local segments = arg.RawSegments
+					if arg == lastArg then
+						segments[#segments] = replace
+					end
+
+					local argText = arg.Prefix .. table.concat(segments, ",")
+
+					if argText:find(" ") or argText == "" then
+						argText = ("%q"):format(argText)
+					end
+
+					newText = ("%s %s"):format(newText, argText)
+
+					if arg == lastArg then
+						break
+					end
+				end
+			else
+				newText = replace
+			end
+			task.wait()
+			self:SetEntryText(newText .. (insertSpace and " " or ""))
+		else
+			task.wait()
+			self:SetEntryText(self:GetEntryText())
+		end
+	else
+		self:ClearHistoryState()
+	end
+end
+
+Entry.TextBox.FocusLost:Connect(function(submit)
+	return Window:LoseFocus(submit)
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	return Window:BeginInput(input, gameProcessed)
+end)
+
+Entry.TextBox:GetPropertyChangedSignal("Text"):Connect(function()
+	Gui.CanvasPosition = Vector2.new(0, Gui.AbsoluteCanvasSize.Y)
+
+	if Entry.TextBox.Text:match("\t") then
+		Entry.TextBox.Text = Entry.TextBox.Text:gsub("\t", "")
+		return
+	end
+	if Window.OnTextChanged then
+		return Window.OnTextChanged(Entry.TextBox.Text)
+	end
+end)
+
+Gui.ChildAdded:Connect(function()
+	task.defer(Window.UpdateWindowHeight)
+end)
+
+return Window
